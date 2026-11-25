@@ -1,0 +1,63 @@
+name: Archive encrypted signed apps
+on:
+  workflow_run:
+    workflows: ['Temporary signer readiness and encrypted dispatch']
+    types: [completed]
+    branches: [main]
+permissions:
+  actions: read
+  contents: read
+concurrency:
+  group: por-backup-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+jobs:
+  archive:
+    if: vars.POR_ARCHIVE_ENABLED == 'true' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'repository_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check for a complete encrypted batch
+        id: batch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -Eeuo pipefail
+          count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts" --jq '[.artifacts[] | select(.name == "por-encrypted-archive" and .expired == false)] | length')
+          if [ "$count" = 1 ]; then echo 'ready=true' >> "$GITHUB_OUTPUT"; else echo 'No complete encrypted batch; nothing to archive.'; fi
+      - name: Download encrypted files only
+        if: steps.batch.outputs.ready == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: por-encrypted-archive
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/por-encrypted
+      - name: Publish and verify encrypted backup
+        if: steps.batch.outputs.ready == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.POR_ARCHIVE_TOKEN }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -n "$GH_TOKEN"
+          cd "$RUNNER_TEMP/por-encrypted"
+          shopt -s nullglob
+          files=(part-*.enc manifest.enc)
+          test "${#files[@]}" = 7
+          for file in "${files[@]}"; do
+            [[ "$file" =~ ^(part-0[1-6]|manifest)\.enc$ ]]
+            test -f "$file" && test ! -L "$file"
+            test "$(head -c 8 "$file")" = 'PORARC01'
+          done
+          repo=ikira18/apptest
+          tag="por-backup-$SOURCE_RUN"
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$repo" --target main --title 'Encrypted temporary signing backup' --notes 'Encrypted backup; no public installation link.' --latest=false
+          fi
+          gh release upload "$tag" --repo "$repo" --clobber "${files[@]}"
+          mkdir -p "$RUNNER_TEMP/por-verify"
+          gh release download "$tag" --repo "$repo" --pattern '*.enc' --dir "$RUNNER_TEMP/por-verify"
+          for file in "${files[@]}"; do cmp -s "$file" "$RUNNER_TEMP/por-verify/$file"; done
+          echo 'Encrypted backup uploaded and verified. R2 originals retained.'
