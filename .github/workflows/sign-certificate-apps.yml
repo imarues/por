@@ -1,0 +1,75 @@
+name: Temporary signer readiness and encrypted dispatch
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [por-sign-encrypted-v1]
+permissions:
+  contents: read
+jobs:
+  prepare:
+    if: github.event_name == 'workflow_dispatch' || vars.POR_LIVE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Verify private signing inputs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CERT_READ_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          test -n "$GH_TOKEN"
+          mkdir -p "$RUNNER_TEMP/por-private/signer"
+          cd "$RUNNER_TEMP/por-private"
+          for f in prepare-and-sign-budget.sh sign.sh normalize-external-p12.sh fetch-zsign.sh archive-release.sh; do
+            gh api "repos/imarues/cert/contents/signer/$f?ref=bc7c2d111defcb43d1c91cae644bb8939c5f3aee" --jq .content | base64 -d > "signer/$f"
+            bash -n "signer/$f"
+          done
+          gh release view app --repo imarues/cert --json assets --jq '.assets | length >= 6' | grep -qx true
+          echo 'Private signer files and release access verified.'
+      - name: Execute authenticated signing job
+        if: github.event_name == 'repository_dispatch' && vars.POR_LIVE_ENABLED == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CERT_READ_TOKEN }}
+          POR_SIGNING_KEY: ${{ secrets.POR_SIGNING_KEY }}
+        run: |
+          set -Eeuo pipefail
+          cd "$RUNNER_TEMP/por-private"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const cp = require('node:child_process');
+          async function main() {
+            if (Date.now() >= Date.parse('2026-12-01T00:00:00Z')) throw Error('Temporary signing period ended');
+            const key = process.env.POR_SIGNING_KEY || '';
+            if (!/^[a-fA-F0-9]{64}$/.test(key)) throw Error('Invalid signing key configuration');
+            const p = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).client_payload;
+            const iv = Buffer.from(p.iv || '', 'base64');
+            const encrypted = Buffer.from(p.ciphertext || '', 'base64');
+            if (iv.length !== 12 || encrypted.length <= 16 || encrypted.length > 4096) throw Error('Invalid envelope');
+            const d = crypto.createDecipheriv('aes-256-gcm', Buffer.from(key, 'hex'), iv);
+            d.setAAD(Buffer.from('imarues/por:v1'));
+            d.setAuthTag(encrypted.subarray(-16));
+            const v = JSON.parse(Buffer.concat([d.update(encrypted.subarray(0,-16)),d.final()]));
+            const allowed = ['KSign','ESign','BatSign','NeoSign','GBox','LCSign'];
+            if (!Number.isFinite(v.issued_at) || Math.abs(Date.now()-v.issued_at)>30*60*1000 || !/^[A-Za-z0-9-]{1,128}$/.test(v.job_id) || !/^[a-f0-9]{48}$/.test(v.job_token) || !/^[A-Za-z0-9-]{16,64}$/.test(v.udid) || !/^\d+$/.test(v.redemption_id) || !Array.isArray(v.apps) || !v.apps.length || !v.apps.every(x=>allowed.includes(x))) throw Error('Invalid job');
+            const base = 'https://ikira-flare-bot.kiraplus.workers.dev';
+            if (v.worker_base !== base) throw Error('Invalid callback origin');
+            const env = {...process.env, GITHUB_REPOSITORY:'imarues/cert', WORKER_BASE:base, JOB_ID:v.job_id, JOB_TOKEN:v.job_token, UDID:v.udid, REDEMPTION_ID:v.redemption_id, EXTERNAL_SIGNING:String(v.external_signing===true), NO_CERT_INJECTION:String(v.no_cert_injection===true), SIGN_APPS:v.apps.join(','), SIGNER_BASE_DIR:process.cwd()+'/signer/runtime', RELEASE_STORAGE_ENABLED:'false'};
+            delete env.POR_SIGNING_KEY;
+            delete env.RELEASE_STORAGE_TOKEN;
+            // Never print subprocess output in a public Actions log.
+            const run = cp.spawnSync('timeout',['--signal=TERM','--kill-after=3s','80s','bash','signer/prepare-and-sign-budget.sh'],{env,stdio:'ignore',timeout:87000});
+            if (run.status !== 0) {
+              await fetch(base+'/internal/signing/jobs/'+v.job_id+'/fail',{method:'POST',headers:{Authorization:'Bearer '+v.job_token,'Content-Type':'application/json'},body:JSON.stringify({error:'Temporary signer failed'}),signal:AbortSignal.timeout(8000)}).catch(()=>{});
+              throw Error('Signing job failed');
+            }
+            console.log('Signing job finished; result delivered through authenticated callback.');
+          }
+          main().catch(()=>{console.error('Temporary signer failed validation or execution.');process.exitCode=1;});
+          NODE
+      - name: Remove temporary files
+        if: always()
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/por-private" "$RUNNER_TEMP/zsign-extract" "$RUNNER_TEMP/zsign.tar.gz"
