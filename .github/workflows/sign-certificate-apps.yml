@@ -53,7 +53,7 @@ jobs:
             d.setAuthTag(encrypted.subarray(-16));
             const v = JSON.parse(Buffer.concat([d.update(encrypted.subarray(0,-16)),d.final()]));
             const allowed = ['KSign','ESign','BatSign','NeoSign','GBox','LCSign'];
-            if (!Number.isFinite(v.issued_at) || Math.abs(Date.now()-v.issued_at)>30*60*1000 || !/^[A-Za-z0-9-]{1,128}$/.test(v.job_id) || !/^[a-f0-9]{48}$/.test(v.job_token) || !/^[A-Za-z0-9-]{16,64}$/.test(v.udid) || !/^\d+$/.test(v.redemption_id) || !Array.isArray(v.apps) || !v.apps.length || !v.apps.every(x=>allowed.includes(x))) throw Error('Invalid job');
+            if (!Number.isFinite(v.issued_at) || Math.abs(Date.now()-v.issued_at)>30*60*1000 || !/^[A-Za-z0-9-]{1,128}$/.test(v.job_id) || !/^[a-f0-9]{64}$/.test(v.job_token) || !/^[A-Za-z0-9-]{16,64}$/.test(v.udid) || !/^\d+$/.test(v.redemption_id) || !Array.isArray(v.apps) || !v.apps.length || !v.apps.every(x=>allowed.includes(x))) throw Error('Invalid job');
             const base = 'https://ikira-flare-bot.kiraplus.workers.dev';
             if (v.worker_base !== base) throw Error('Invalid callback origin');
             const env = {...process.env, GITHUB_REPOSITORY:'imarues/cert', WORKER_BASE:base, JOB_ID:v.job_id, JOB_TOKEN:v.job_token, UDID:v.udid, REDEMPTION_ID:v.redemption_id, EXTERNAL_SIGNING:String(v.external_signing===true), NO_CERT_INJECTION:String(v.no_cert_injection===true), SIGN_APPS:v.apps.join(','), SIGNER_BASE_DIR:process.cwd()+'/signer/runtime', RELEASE_STORAGE_ENABLED:'false'};
