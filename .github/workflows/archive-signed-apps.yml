@@ -1,5 +1,6 @@
-name: Archive encrypted signed apps
+name: Archive signed apps to private releases
 on:
+  workflow_dispatch:
   workflow_run:
     workflows: ['Temporary signer readiness and encrypted dispatch']
     types: [completed]
@@ -8,15 +9,28 @@ permissions:
   actions: read
   contents: read
 concurrency:
-  group: por-backup-${{ github.event.workflow_run.id }}
+  group: por-backup-${{ github.event.workflow_run.id || github.run_id }}
   cancel-in-progress: false
 jobs:
   archive:
-    if: vars.POR_ARCHIVE_ENABLED == 'true' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'repository_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository
+    if: github.event_name == 'workflow_dispatch' || (vars.POR_ARCHIVE_ENABLED == 'true' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'repository_dispatch' && github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
-      - name: Check for a complete encrypted batch
+      - name: Verify private storage and credentials
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.POR_ARCHIVE_TOKEN }}
+          POR_ARCHIVE_KEY: ${{ secrets.POR_ARCHIVE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          test -n "$GH_TOKEN"
+          [[ "$POR_ARCHIVE_KEY" =~ ^[a-fA-F0-9]{64}$ ]]
+          test "$(gh api repos/ikira18/apptest --jq '.private and .visibility == "private"')" = true
+          test "$(gh api repos/ikira18/apptest --jq '.permissions.push // false')" = true
+          echo 'Private archive repository access verified.'
+      - name: Check for encrypted job ticket
+        if: github.event_name == 'workflow_run'
         id: batch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -24,8 +38,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           count=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts" --jq '[.artifacts[] | select(.name == "por-encrypted-archive" and .expired == false)] | length')
-          if [ "$count" = 1 ]; then echo 'ready=true' >> "$GITHUB_OUTPUT"; else echo 'No complete encrypted batch; nothing to archive.'; fi
-      - name: Download encrypted files only
+          if [ "$count" = 1 ]; then echo 'ready=true' >> "$GITHUB_OUTPUT"; else echo 'No archive ticket; R2 originals retained.'; fi
+      - name: Download encrypted ticket only
         if: steps.batch.outputs.ready == 'true'
         uses: actions/download-artifact@v4
         with:
@@ -33,31 +47,70 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/por-encrypted
-      - name: Publish and verify encrypted backup
+      - name: Retrieve and verify pinned archive script
         if: steps.batch.outputs.ready == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.POR_ARCHIVE_TOKEN }}
-          SOURCE_RUN: ${{ github.event.workflow_run.id }}
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.CERT_READ_TOKEN }}
         run: |
           set -Eeuo pipefail
-          test -n "$GH_TOKEN"
-          cd "$RUNNER_TEMP/por-encrypted"
-          shopt -s nullglob
-          files=(part-*.enc manifest.enc)
-          test "${#files[@]}" = 7
-          for file in "${files[@]}"; do
-            [[ "$file" =~ ^(part-0[1-6]|manifest)\.enc$ ]]
-            test -f "$file" && test ! -L "$file"
-            test "$(head -c 8 "$file")" = 'PORARC01'
-          done
-          repo=ikira18/apptest
-          tag="por-backup-$SOURCE_RUN"
-          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            gh release create "$tag" --repo "$repo" --target main --title 'Encrypted temporary signing backup' --notes 'Encrypted backup; no public installation link.' --latest=false
-          fi
-          gh release upload "$tag" --repo "$repo" --clobber "${files[@]}"
-          mkdir -p "$RUNNER_TEMP/por-verify"
-          gh release download "$tag" --repo "$repo" --pattern '*.enc' --dir "$RUNNER_TEMP/por-verify"
-          for file in "${files[@]}"; do cmp -s "$file" "$RUNNER_TEMP/por-verify/$file"; done
-          echo 'Encrypted backup uploaded and verified. R2 originals retained.'
+          umask 077
+          mkdir -p "$RUNNER_TEMP/por-archive"
+          gh api 'repos/imarues/cert/contents/signer/archive-release.sh?ref=bc7c2d111defcb43d1c91cae644bb8939c5f3aee' --jq .content | base64 -d > "$RUNNER_TEMP/por-archive/archive-release.sh"
+          bash -n "$RUNNER_TEMP/por-archive/archive-release.sh"
+      - name: Fetch verified R2 apps and archive to private releases
+        if: steps.batch.outputs.ready == 'true'
+        shell: bash
+        env:
+          POR_ARCHIVE_KEY: ${{ secrets.POR_ARCHIVE_KEY }}
+          GH_TOKEN: ${{ secrets.POR_ARCHIVE_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          cd "$RUNNER_TEMP/por-archive"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const cp = require('node:child_process');
+          const {pipeline} = require('node:stream/promises');
+          const {Readable,Transform} = require('node:stream');
+          async function main() {
+            const key = process.env.POR_ARCHIVE_KEY || '';
+            if (!/^[a-fA-F0-9]{64}$/.test(key) || new Set(key.toLowerCase()).size < 10 || key.toLowerCase() === 'a7f3c9e2b814d065e92f7a3c6d108b54f9e2c7a16b835d04e6f19c2a78d5b301') throw Error('Invalid archive key');
+            const file = process.env.RUNNER_TEMP+'/por-encrypted/manifest.enc';
+            const stat=fs.lstatSync(file);
+            if (!stat.isFile() || stat.size<37 || stat.size>8192) throw Error('Invalid ticket');
+            const data=fs.readFileSync(file);
+            if (data.subarray(0,8).toString()!=='PORARC01') throw Error('Invalid ticket');
+            const d=crypto.createDecipheriv('aes-256-gcm',Buffer.from(key,'hex'),data.subarray(8,20));
+            d.setAAD(Buffer.from('PORARC01')); d.setAuthTag(data.subarray(-16));
+            const v=JSON.parse(Buffer.concat([d.update(data.subarray(20,-16)),d.final()]));
+            if (v.version!==2 || !/^[A-Za-z0-9-]{1,128}$/.test(v.job_id) || !/^[a-f0-9]{64}$/.test(v.job_token) || !/^\d+$/.test(v.redemption_id) || !/^[A-Za-z0-9-]{16,64}$/.test(v.udid)) throw Error('Invalid archive ticket');
+            const base='https://ikira-flare-bot.kiraplus.workers.dev';
+            const apps=['KSign','ESign','BatSign','NeoSign','GBox','LCSign'];
+            await Promise.all(apps.map(async app=>{
+              const res=await fetch(base+'/internal/signing/jobs/'+v.job_id+'/archive-source/'+app,{headers:{Authorization:'Bearer '+v.job_token,'X-Por-Archive-Key':key},redirect:'error',signal:AbortSignal.timeout(120000)});
+              if (!res.ok || !res.body) throw Error('R2 source unavailable');
+              const expected=res.headers.get('X-Content-SHA256')||'';
+              const size=Number(res.headers.get('Content-Length'));
+              if (!/^[a-f0-9]{64}$/.test(expected) || !Number.isSafeInteger(size) || size<=0 || size>=2147483648) throw Error('Missing integrity metadata');
+              fs.mkdirSync(app,{mode:0o700});
+              const sha=crypto.createHash('sha256'); let received=0;
+              await pipeline(Readable.fromWeb(res.body),new Transform({transform(chunk,enc,cb){received+=chunk.length;if(received>size)return cb(Error('Oversized source'));sha.update(chunk);cb(null,chunk);}}),fs.createWriteStream(app+'/'+app+'_signed.ipa',{mode:0o600}));
+              if (received!==size || sha.digest('hex')!==expected) throw Error('R2 integrity mismatch');
+            }));
+            // Fail closed if the target ever becomes public again.
+            const check=cp.spawnSync('gh',['api','repos/ikira18/apptest','--jq','.private and .visibility == "private"'],{encoding:'utf8',timeout:15000});
+            if(check.status!==0 || check.stdout.trim()!=='true') throw Error('Archive target is not private');
+            const env={...process.env,RELEASE_STORAGE_ENABLED:'true',RELEASE_STORAGE_TOKEN:process.env.GH_TOKEN,RELEASE_STORAGE_OWNER:'ikira18',RELEASE_STORAGE_REPO:'apptest',WORKER_BASE:base,JOB_ID:v.job_id,JOB_TOKEN:v.job_token,UDID:v.udid,REDEMPTION_ID:v.redemption_id};
+            delete env.POR_ARCHIVE_KEY;
+            const archived=cp.spawnSync('bash',['archive-release.sh'],{env,stdio:'ignore',timeout:420000});
+            if(archived.status!==0) throw Error('Archive upload or receipt failed');
+            console.log('Six private IPA assets archived and verified by Worker. Existing R2 hold policy applies.');
+          }
+          main().catch(()=>{console.error('Private archive failed; R2 originals remain available.');process.exitCode=1;});
+          NODE
+      - name: Clean temporary archive files
+        if: always()
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/por-archive" "$RUNNER_TEMP/por-encrypted"

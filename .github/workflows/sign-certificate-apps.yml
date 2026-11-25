@@ -86,18 +86,7 @@ jobs:
             const archiveKey = process.env.POR_ARCHIVE_KEY || '';
             const archiveEnabled = process.env.POR_ARCHIVE_ENABLED === 'true';
             const archiveSafe = archiveEnabled && /^[a-fA-F0-9]{64}$/.test(archiveKey) && archiveKey.toLowerCase() !== key.toLowerCase() && new Set(archiveKey.toLowerCase()).size >= 10 && archiveKey.toLowerCase() !== 'a7f3c9e2b814d065e92f7a3c6d108b54f9e2c7a16b835d04e6f19c2a78d5b301';
-            const source = process.env.RUNNER_TEMP+'/por-archive-source';
             const dest = process.env.RUNNER_TEMP+'/por-encrypted-archive';
-            if (archiveSafe && new Set(v.apps).size === 6) {
-              fs.mkdirSync(source,{mode:0o700,recursive:true});
-              const script = 'signer/sign.sh';
-              const original = fs.readFileSync(script,'utf8');
-              const anchor = '  rm -rf "${WORK_DIR}" || true';
-              const capture = '  if [ "$rc" -eq 0 ] && [ "$SUCCESS" -eq 1 ]; then\n    for app in KSign ESign BatSign NeoSign GBox LCSign; do\n      test -s "$WORK_DIR/$app/${app}_signed.ipa" || continue\n      mv -- "$WORK_DIR/$app/${app}_signed.ipa" "$POR_ARCHIVE_SOURCE/$app.ipa" || true\n    done\n  fi\n';
-              if (original.split(anchor).length !== 2) throw Error('Archive capture hook changed');
-              fs.writeFileSync(script,original.replace(anchor,capture+anchor));
-              env.POR_ARCHIVE_SOURCE=source;
-            }
             delete env.POR_ARCHIVE_KEY;
             delete env.POR_ARCHIVE_ENABLED;
             delete env.POR_SIGNING_KEY;
@@ -110,45 +99,32 @@ jobs:
             }
             console.log('Signing job finished; result delivered through authenticated callback.');
             if (archiveEnabled && !archiveSafe) console.log('::warning::Archive key is missing or unsuitable; R2 originals retained.');
-            if (archiveSafe && new Set(v.apps).size === 6) {
-              const apps = ['KSign','ESign','BatSign','NeoSign','GBox','LCSign'];
-              const {pipeline} = require('node:stream/promises');
-              const {Readable} = require('node:stream');
+            if (archiveSafe) {
               try {
-                if (!apps.every(app=>fs.existsSync(source+'/'+app+'.ipa'))) throw Error('Incomplete batch');
                 fs.mkdirSync(dest,{mode:0o700,recursive:true});
-                async function encrypt(input,file) {
-                  const iv = crypto.randomBytes(12);
-                  const cipher = crypto.createCipheriv('aes-256-gcm',Buffer.from(archiveKey,'hex'),iv);
-                  cipher.setAAD(Buffer.from('PORARC01'));
-                  fs.writeFileSync(file,Buffer.concat([Buffer.from('PORARC01'),iv]),{mode:0o600});
-                  await pipeline(input,cipher,fs.createWriteStream(file,{flags:'a',mode:0o600}));
-                  fs.appendFileSync(file,cipher.getAuthTag());
-                }
-                const entries=[];
-                for(let i=0;i<apps.length;i++){
-                  const app=apps[i], name='part-'+String(i+1).padStart(2,'0')+'.enc';
-                  await encrypt(fs.createReadStream(source+'/'+app+'.ipa'),dest+'/'+name);
-                  entries.push({app,file:name});
-                }
-                await encrypt(Readable.from([Buffer.from(JSON.stringify({version:1,job_id:v.job_id,redemption_id:v.redemption_id,udid:v.udid,apps:entries}))]),dest+'/manifest.enc');
+                const iv = crypto.randomBytes(12);
+                const cipher = crypto.createCipheriv('aes-256-gcm',Buffer.from(archiveKey,'hex'),iv);
+                cipher.setAAD(Buffer.from('PORARC01'));
+                const data = Buffer.concat([cipher.update(JSON.stringify({version:2,job_id:v.job_id,job_token:v.job_token,redemption_id:v.redemption_id,udid:v.udid})),cipher.final()]);
+                fs.writeFileSync(dest+'/manifest.enc',Buffer.concat([Buffer.from('PORARC01'),iv,data,cipher.getAuthTag()]),{mode:0o600});
                 fs.appendFileSync(process.env.GITHUB_OUTPUT,'archive_ready=true\n');
-                console.log('Encrypted backup batch ready; no plaintext will be uploaded.');
+                console.log('Encrypted archive job ticket ready.');
               } catch {
                 fs.rmSync(dest,{recursive:true,force:true});
-                console.log('::warning::Backup preparation failed; R2 originals retained.');
-              } finally {fs.rmSync(source,{recursive:true,force:true});}
+                console.log('::warning::Archive ticket preparation failed; R2 originals retained.');
+              }
             }
 
           }
           main().catch(()=>{console.error('Temporary signer failed validation or execution.');process.exitCode=1;});
           NODE
-      - name: Transfer encrypted backup to separate archive run
+      - name: Transfer encrypted archive ticket to separate run
+        continue-on-error: true
         if: success() && steps.sign.outputs.archive_ready == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: por-encrypted-archive
-          path: ${{ runner.temp }}/por-encrypted-archive/*.enc
+          path: ${{ runner.temp }}/por-encrypted-archive/manifest.enc
           retention-days: 1
           if-no-files-found: error
           compression-level: 0
