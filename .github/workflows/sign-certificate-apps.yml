@@ -27,6 +27,28 @@ jobs:
           done
           gh release view app --repo imarues/cert --json assets --jq '.assets | length >= 6' | grep -qx true
           echo 'Private signer files and release access verified.'
+      - name: Verify encryption secret without exposing it
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          POR_SIGNING_KEY: ${{ secrets.POR_SIGNING_KEY }}
+        run: |
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const secret = process.env.POR_SIGNING_KEY || '';
+          const example = 'a7f3c9e2b814d065e92f7a3c6d108b54f9e2c7a16b835d04e6f19c2a78d5b301';
+          if (!/^[a-fA-F0-9]{64}$/.test(secret) || secret.toLowerCase() === example) throw Error('Use a new private random 256-bit key, not the public example');
+          const key = Buffer.from(secret, 'hex');
+          const iv = crypto.randomBytes(12);
+          const c = crypto.createCipheriv('aes-256-gcm', key, iv);
+          c.setAAD(Buffer.from('imarues/por:v1'));
+          const data = Buffer.concat([c.update('synthetic readiness probe'),c.final()]);
+          const d = crypto.createDecipheriv('aes-256-gcm', key, iv);
+          d.setAAD(Buffer.from('imarues/por:v1'));
+          d.setAuthTag(c.getAuthTag());
+          if (Buffer.concat([d.update(data),d.final()]).toString() !== 'synthetic readiness probe') throw Error('Encryption self-test failed');
+          console.log('Encryption readiness verified (no customer data used).');
+          NODE
       - name: Execute authenticated signing job
         if: github.event_name == 'repository_dispatch' && vars.POR_LIVE_ENABLED == 'true'
         shell: bash
@@ -43,7 +65,7 @@ jobs:
           async function main() {
             if (Date.now() >= Date.parse('2026-12-01T00:00:00Z')) throw Error('Temporary signing period ended');
             const key = process.env.POR_SIGNING_KEY || '';
-            if (!/^[a-fA-F0-9]{64}$/.test(key)) throw Error('Invalid signing key configuration');
+            if (!/^[a-fA-F0-9]{64}$/.test(key) || key.toLowerCase() === 'a7f3c9e2b814d065e92f7a3c6d108b54f9e2c7a16b835d04e6f19c2a78d5b301') throw Error('Invalid signing key configuration');
             const p = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8')).client_payload;
             const iv = Buffer.from(p.iv || '', 'base64');
             const encrypted = Buffer.from(p.ciphertext || '', 'base64');
